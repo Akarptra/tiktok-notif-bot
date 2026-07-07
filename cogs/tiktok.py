@@ -1,16 +1,9 @@
 """
-cogs/tiktok.py — Fitur inti: registrasi akun TikTok & loop notifikasi. (REVISI v2)
+cogs/tiktok.py — Fitur inti: registrasi akun TikTok & loop notifikasi. (REVISI v3)
 
-Perubahan dari v1:
-1. Parameter API disesuaikan dengan ScrapTik: {"unique_id": username, "count": 10}
-   (sebelumnya {"username": ...} → menyebabkan 404).
-2. Semua pemanggilan database sekarang keyed by `tiktok_username`
-   (menyesuaikan skema baru di database.py di mana username = PRIMARY KEY).
-3. Fitur pengecekan LIVE dinonaktifkan sementara (di-comment) karena endpoint
-   live di ScrapTik belum ditemukan. Kodenya dibiarkan utuh agar mudah
-   diaktifkan kembali nanti.
-4. /set_tiktok kini mendukung banyak akun per user; /remove_tiktok menerima
-   parameter username agar user bisa memilih akun mana yang dihapus.
+Fitur Baru:
+1. Menangani akun yang benar-benar kosong (0 video) menggunakan status "EMPTY".
+2. Sistem API Key Rotation (Failover) - pindah ke key berikutnya jika limit (429/403).
 """
 
 import asyncio
@@ -27,15 +20,8 @@ log = logging.getLogger("cogs.tiktok")
 
 # ── Konfigurasi API (ScrapTik via RapidAPI) ──────────────────────────────────
 RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "scraptik.p.rapidapi.com")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "YOUR_RAPIDAPI_KEY_HERE")
-
 VIDEO_ENDPOINT = f"https://{RAPIDAPI_HOST}/user/posts"
-# LIVE_ENDPOINT = f"https://{RAPIDAPI_HOST}/user/live"  # ⏸️ belum dipakai — endpoint live belum ditemukan
-
-API_HEADERS = {
-    "X-RapidAPI-Key": RAPIDAPI_KEY,
-    "X-RapidAPI-Host": RAPIDAPI_HOST,
-}
+# LIVE_ENDPOINT = f"https://{RAPIDAPI_HOST}/user/live"  # ⏸️ belum dipakai
 
 CHECK_INTERVAL_MINUTES = 10
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)  # detik
@@ -48,6 +34,14 @@ class TikTokCog(commands.Cog):
         self.db = bot.db
         self.notif_channel_id = int(os.getenv("NOTIF_CHANNEL_ID", "0"))
         self.session: Optional[aiohttp.ClientSession] = None
+        
+        # --- ROTASI API KEY ---
+        # Pastikan di file .env lu nulisnya: RAPIDAPI_KEYS=key1,key2,key3
+        keys_env = os.getenv("RAPIDAPI_KEYS", "")
+        self.api_keys = [k.strip() for k in keys_env.split(",") if k.strip()]
+        self.current_key_index = 0
+        if not self.api_keys:
+            log.warning("RAPIDAPI_KEYS kosong! Bot tidak bisa mengambil data.")
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
     async def cog_load(self):
@@ -105,7 +99,6 @@ class TikTokCog(commands.Cog):
     async def remove_tiktok(self, interaction: discord.Interaction, username: str):
         username = username.strip().lstrip("@").lower()
 
-        # Pastikan akun ini memang milik user yang memanggil command
         row = await asyncio.to_thread(self.db.get_member, username)
         if row is None:
             await interaction.response.send_message(
@@ -158,23 +151,16 @@ class TikTokCog(commands.Cog):
 
         channel = self.bot.get_channel(self.notif_channel_id)
         if channel is None:
-            log.warning(
-                "Channel notifikasi (ID: %s) tidak ditemukan. "
-                "Cek NOTIF_CHANNEL_ID di .env dan pastikan bot punya akses.",
-                self.notif_channel_id,
-            )
+            log.warning("Channel notifikasi tidak ditemukan.")
             return
 
         log.info("Mulai pengecekan %d akun TikTok...", len(members))
 
         for row in members:
-            # Error per-akun diisolasi: satu akun gagal, sisanya tetap dicek.
             try:
                 await self._check_single_member(row, channel)
             except Exception:
-                log.exception(
-                    "Error tak terduga saat mengecek @%s", row["tiktok_username"]
-                )
+                log.exception("Error saat mengecek @%s", row["tiktok_username"])
             await asyncio.sleep(DELAY_BETWEEN_USERS)
 
         log.info("Pengecekan selesai.")
@@ -196,55 +182,69 @@ class TikTokCog(commands.Cog):
         username = row["tiktok_username"]
         user_id = row["discord_user_id"]
 
-        # 1) Cek video terbaru
         video = await self._fetch_latest_video(username)
         if video is not None:
             video_id, video_url, video_desc = video
+            
+            # KONDISI 1: Akun ini nggak punya video sama sekali (Kosong)
+            if video_id == "EMPTY":
+                if row["last_video_id"] != "EMPTY":
+                    await asyncio.to_thread(self.db.update_last_video, username, "EMPTY")
+                return 
+
+            # KONDISI 2: Pertama kali dicek dan ternyata ada videonya (Baseline)
             if row["last_video_id"] is None:
-                # Pertama kali dicek: simpan baseline saja, JANGAN notif,
-                # supaya video lama tidak dianggap "baru".
                 await asyncio.to_thread(self.db.update_last_video, username, video_id)
+                
+            # KONDISI 3: Tadinya kosong ("EMPTY"), sekarang ada videonya (Upload Pertama!)
+            elif row["last_video_id"] == "EMPTY":
+                await self._send_video_notification(
+                    channel, user_id, username, video_url, video_desc
+                )
+                await asyncio.to_thread(self.db.update_last_video, username, video_id)
+
+            # KONDISI 4: Akun normal, ada video baru
             elif video_id != row["last_video_id"]:
                 await self._send_video_notification(
                     channel, user_id, username, video_url, video_desc
                 )
                 await asyncio.to_thread(self.db.update_last_video, username, video_id)
 
-        # ─────────────────────────────────────────────────────────────────────
-        # 2) Cek status live — ⏸️ DINONAKTIFKAN SEMENTARA
-        # Endpoint live di ScrapTik belum ditemukan. Blok ini di-comment agar
-        # loop tidak error. Aktifkan lagi (uncomment) + buka comment
-        # LIVE_ENDPOINT di atas jika endpoint-nya sudah ketemu.
-        # ─────────────────────────────────────────────────────────────────────
-        # is_live_now = await self._fetch_live_status(username)
-        # if is_live_now is not None:
-        #     was_live = bool(row["is_live"])
-        #     if is_live_now and not was_live:
-        #         # Baru mulai live → notif sekali
-        #         await self._send_live_notification(channel, user_id, username)
-        #         await asyncio.to_thread(self.db.update_live_status, username, True)
-        #     elif not is_live_now and was_live:
-        #         # Live selesai → reset flag agar live berikutnya dinotif lagi
-        #         await asyncio.to_thread(self.db.update_live_status, username, False)
-
     # ── API calls (aiohttp) ──────────────────────────────────────────────────
-    async def _api_get(self, url: str, params: dict) -> Optional[dict]:
-        """GET request generik dengan error handling lengkap.
+    async def _api_get(self, url: str, params: dict, retries=0) -> Optional[dict]:
+        """GET request dengan fitur auto-ganti API Key kalau limit."""
+        if not self.api_keys:
+            return None
 
-        Return None jika gagal (timeout, rate limit, error server, dll.)
-        sehingga pemanggil bisa skip dengan aman.
-        """
+        # Kalau udah nyoba sebanyak jumlah key yang kita punya tapi gagal semua
+        if retries >= len(self.api_keys):
+            log.error("Semua API Key udah limit/habis! Skip request dulu.")
+            return None
+
+        # Ambil key yang aktif sekarang
+        current_key = self.api_keys[self.current_key_index]
+        
+        # Header dinamis
+        headers = {
+            "X-RapidAPI-Key": current_key,
+            "X-RapidAPI-Host": RAPIDAPI_HOST,
+        }
+
         try:
-            async with self.session.get(url, params=params, headers=API_HEADERS) as resp:
-                if resp.status == 429:
-                    log.warning("Rate limit RapidAPI tercapai (429). Skip: %s", params)
-                    return None
+            async with self.session.get(url, params=params, headers=headers) as resp:
+                # 429 = Too Many Requests, 403 = Forbidden (Kuota bulanan habis)
+                if resp.status in (429, 403):
+                    log.warning(f"API Key index-{self.current_key_index} limit. Pindah ke key berikutnya...")
+                    self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+                    return await self._api_get(url, params, retries + 1)
+
                 if resp.status == 404:
                     log.info("Data tidak ditemukan (404) untuk: %s", params)
                     return None
                 if resp.status != 200:
                     log.warning("API balas status %s untuk %s", resp.status, params)
                     return None
+                    
                 return await resp.json(content_type=None)
 
         except asyncio.TimeoutError:
@@ -253,20 +253,12 @@ class TikTokCog(commands.Cog):
             log.warning("Error koneksi API untuk %s: %r", params, e)
         except ValueError:
             log.warning("Response API bukan JSON valid untuk %s", params)
+            
         return None
 
     async def _fetch_latest_video(
         self, username: str
     ) -> Optional[tuple[str, str, str]]:
-        """Ambil video terbaru user via ScrapTik.
-
-        Parameter sesuai spesifikasi ScrapTik: unique_id (bukan username) + count.
-        Return (video_id, url, deskripsi) atau None.
-
-        ⚠️ Cek struktur response asli di playground RapidAPI — umumnya ScrapTik
-        mengembalikan list video di key `aweme_list` dengan ID di `aweme_id`.
-        Sesuaikan parsing di bawah jika berbeda.
-        """
         data = await self._api_get(
             VIDEO_ENDPOINT, {"unique_id": username, "count": 10}
         )
@@ -274,64 +266,38 @@ class TikTokCog(commands.Cog):
             return None
 
         try:
-            # ScrapTik umumnya memakai struktur ala API internal TikTok:
-            videos = data.get("aweme_list") or data.get("data", {}).get("videos") or []
+            videos = data.get("aweme_list") or data.get("data", {}).get("videos")
+            
+            if videos == []:  
+                return "EMPTY", "", ""
+                
             if not videos:
                 return None
+
             latest = videos[0]
             video_id = str(latest.get("aweme_id") or latest.get("video_id"))
             video_desc = latest.get("desc", "") or latest.get("title", "")
             video_url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+            
             if video_id in ("None", ""):
                 log.warning("ID video tidak ditemukan di response (@%s)", username)
                 return None
+                
             return video_id, video_url, video_desc
         except (KeyError, IndexError, TypeError, AttributeError) as e:
             log.warning("Struktur response video tak terduga (@%s): %r", username, e)
             return None
 
-    # async def _fetch_live_status(self, username: str) -> Optional[bool]:
-    #     """⏸️ DINONAKTIFKAN — aktifkan kembali saat endpoint live ditemukan."""
-    #     data = await self._api_get(LIVE_ENDPOINT, {"unique_id": username})
-    #     if not data:
-    #         return None
-    #     try:
-    #         return bool(data.get("data", {}).get("is_live", False))
-    #     except (KeyError, TypeError) as e:
-    #         log.warning("Struktur response live tak terduga (@%s): %r", username, e)
-    #         return None
-
     # ── Pengiriman notifikasi ────────────────────────────────────────────────
     async def _send_video_notification(
         self, channel, discord_user_id: str, username: str, url: str, desc: str
     ):
-        # Cukup kirim teks biasa, Discord bakal otomatis nampilin preview-nya
         content = f"@here 🎬 **Video TikTok Baru!** dari @{username}\n\n{url}"
-        
         try:
             await channel.send(content)
-            log.info("Notif link TikTok (non-embed) terkirim: @%s", username)
+            log.info("Notif link TikTok terkirim: @%s", username)
         except discord.HTTPException:
             log.exception("Gagal mengirim notif @%s", username)
-
-    # async def _send_live_notification(
-    #     self, channel, discord_user_id: str, username: str
-    # ):
-    #     """⏸️ DINONAKTIFKAN — aktifkan kembali bersama fitur live."""
-    #     live_url = f"https://www.tiktok.com/@{username}/live"
-    #     embed = discord.Embed(
-    #         title="🔴 Sedang LIVE di TikTok!",
-    #         description=f"<@{discord_user_id}> sedang live sekarang — yuk gabung!",
-    #         url=live_url,
-    #         color=discord.Color.red(),
-    #     )
-    #     embed.add_field(name="Nonton Live", value=f"[Klik di sini]({live_url})")
-    #     try:
-    #         await channel.send(embed=embed)
-    #         log.info("Notif live terkirim: @%s", username)
-    #     except discord.HTTPException:
-    #         log.exception("Gagal mengirim notif live @%s", username)
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(TikTokCog(bot))
