@@ -47,8 +47,8 @@ from TikTokLive.client.errors import (
 
 log = logging.getLogger("cogs.tiktok_live")
 
-# --- KONFIGURASI BACKOFF (DIPERBARUI) ---
-OFFLINE_RETRY_SECONDS = 1800     # 30 menit sekali (sebelumnya 15m/5m)
+# --- KONFIGURASI BACKOFF ---
+OFFLINE_RETRY_SECONDS = 900      # 15 menit sekali (sesuai komentar)
 AFTER_LIVE_COOLDOWN = 3600       # 1 jam (mencegah spam kalau koneksi goyang)
 RATE_LIMIT_BACKOFF = 3600        # 1 jam (kalau kena rate limit sign server, istirahat lama)
 ERROR_RETRY_SECONDS = 600        # 10 menit (error tak terduga lainnya)
@@ -122,59 +122,27 @@ class TikTokLiveCog(commands.Cog):
     async def _watch_user(self, username: str) -> None:
         while True:
             try:
-                # Client dibuat BARU tiap iterasi — instance TikTokLiveClient
-                # tidak dirancang untuk di-reuse setelah disconnect.
-                # Penambahan Custom header untuk menyamar sebagai browser desktop normal
-                client = TikTokLiveClient(
-                    unique_id=f"@{username}",
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-                    }
-                )
+                # Cukup pakai unique_id saja, jangan pakai headers
+                client = TikTokLiveClient(unique_id=f"@{username}")
                 self._attach_handlers(client, username)
 
-                # Blocking: baris ini "menggantung" selama live berlangsung
-                # dan baru lanjut ketika live berakhir / koneksi putus.
+                # Blocking: tunggu sampai live selesai
                 await client.connect(fetch_room_info=False)
 
-                # Sampai sini artinya live tadi sudah selesai.
-                log.info("Live @%s berakhir. Cooldown %ds sebelum ketuk lagi.",
-                         username, AFTER_LIVE_COOLDOWN)
+                log.info("Live @%s berakhir. Cooldown %ds.", username, AFTER_LIVE_COOLDOWN)
                 await asyncio.sleep(AFTER_LIVE_COOLDOWN)
 
             except asyncio.CancelledError:
                 # Watcher dimatikan (cog unload / akun dihapus) — keluar bersih.
-                log.info("Watcher @%s dibatalkan.", username)
                 raise
             except UserOfflineError:
-                # Normal & paling sering: user sedang tidak live. Tidur, ulangi.
-                log.debug("@%s offline. Cek lagi dalam %ds.",
-                          username, OFFLINE_RETRY_SECONDS)
+                # Jeda 15 menit buat user offline biar IP lu nggak di-banned terus
                 await asyncio.sleep(OFFLINE_RETRY_SECONDS)
-            except UserNotFoundError:
-                # Akun tidak eksis (typo / di-banned / ganti username).
-                # Percuma diulang — matikan satpam untuk akun ini.
-                log.warning(
-                    "Akun TikTok @%s tidak ditemukan. Watcher dihentikan permanen "
-                    "(perbaiki username via /remove_tiktok lalu /set_tiktok).",
-                    username,
-                )
-                return
-            except SignatureRateLimitError:
-                # Sign server TikTokLive punya kuota koneksi. Backoff lebih lama.
-                log.warning("Rate limit sign server untuk @%s. Backoff %ds.",
-                            username, RATE_LIMIT_BACKOFF)
-                await asyncio.sleep(RATE_LIMIT_BACKOFF)
             except Exception as e:
-                # Cek apakah error karena 403 (Forbidden) atau 404 (diblokir TikTok)
-                if "403" in str(e) or "404" in str(e):
-                    log.warning(f"TikTok memblokir request untuk @{username}. Jeda lebih lama.")
-                    await asyncio.sleep(3600) # Tunggu 1 jam kalau kena blokir
-                else:
-                    # Jaring pengaman: error apa pun tidak boleh mematikan loop.
-                    log.exception("Error tak terduga di watcher @%s. Retry dalam %ds.",
-                                  username, ERROR_RETRY_SECONDS)
-                    await asyncio.sleep(ERROR_RETRY_SECONDS)
+                # Log detail error biar kita tahu kalau kena 403 lagi
+                log.warning("Gagal akses @%s (Mungkin kena limit TikTok): %s", username, e)
+                # Tunggu lebih lama kalau kena error 403/Forbidden
+                await asyncio.sleep(ERROR_RETRY_SECONDS)
 
     # ── Registrasi event handler per client ──────────────────────────────────
     def _attach_handlers(self, client: TikTokLiveClient, username: str) -> None:
