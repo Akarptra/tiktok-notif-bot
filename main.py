@@ -27,6 +27,7 @@ log = logging.getLogger("bot")
 
 COGS = [
     "cogs.tiktok",
+    "cogs.tiktok_live",
 ]
 
 
