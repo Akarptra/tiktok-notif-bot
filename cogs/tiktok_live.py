@@ -2,30 +2,30 @@
 cogs/tiktok_live.py — Notifikasi LIVE TikTok real-time via library TikTokLive. (v1)
 
 Konsep "Satpam Pengetuk Pintu":
-    Untuk tiap username terdaftar, bot menjalankan SATU background task
-    (asyncio.Task) berisi infinite loop yang terus "mengetuk pintu":
-        1. Buat TikTokLiveClient baru.
-        2. Coba connect (await client.connect() → blocking sampai live selesai).
-        3. Kalau user OFFLINE → UserOfflineError dilempar → tidur 5 menit → ulangi.
-        4. Kalau ONLINE → ConnectEvent terpicu → kirim notif @here ke Discord.
-        5. Live selesai / disconnect → connect() selesai → tidur → ketuk lagi.
+Untuk tiap username terdaftar, bot menjalankan SATU background task
+(asyncio.Task) berisi infinite loop yang terus "mengetuk pintu":
+1. Buat TikTokLiveClient baru.
+2. Coba connect (await client.connect() → blocking sampai live selesai).
+3. Kalau user OFFLINE → UserOfflineError dilempar → tidur 5 menit → ulangi.
+4. Kalau ONLINE → ConnectEvent terpicu → kirim notif @here ke Discord.
+5. Live selesai / disconnect → connect() selesai → tidur → ketuk lagi.
 
-Verifikasi API (TikTokLive v6.x dari PyPI, `pip install TikTokLive`):
-    - Exception offline  : TikTokLive.client.errors.UserOfflineError
-      (di versi lama v4/v5 namanya LiveNotFound — sudah TIDAK ada di v6)
-    - Event              : from TikTokLive.events import ConnectEvent, DisconnectEvent
-    - Blocking connect   : await client.connect()  ← menunggu sampai live berakhir
-      (client.start() itu NON-blocking dan return asyncio.Task — bukan yang
-       kita mau untuk pola while-True ini)
+Verifikasi API (TikTokLive v6.x dari PyPI, pip install TikTokLive):
+- Exception offline  : TikTokLive.client.errors.UserOfflineError
+  (di versi lama v4/v5 namanya LiveNotFound — sudah TIDAK ada di v6)
+- Event              : from TikTokLive.events import ConnectEvent, DisconnectEvent
+- Blocking connect   : await client.connect()  ← menunggu sampai live berakhir
+  (client.start() itu NON-blocking dan return asyncio.Task — bukan yang
+  kita mau untuk pola while-True ini)
 
 Keamanan event loop:
-    TikTokLive berbasis asyncio murni (httpx + websockets), jadi client-nya
-    berjalan di event loop yang SAMA dengan discord.py — tidak ada thread
-    tambahan, tidak ada blocking call. channel.send() dari dalam event handler
-    TikTokLive aman karena masih satu loop.
+TikTokLive berbasis asyncio murni (httpx + websockets), jadi client-nya
+berjalan di event loop yang SAMA dengan discord.py — tidak ada thread
+tambahan, tidak ada blocking call. channel.send() dari dalam event handler
+TikTokLive aman karena masih satu loop.
 
 .env yang dibutuhkan:
-    LIVE_NOTIF_CHANNEL_ID=...   (channel khusus notif live, beda dari video)
+LIVE_NOTIF_CHANNEL_ID=...   (channel khusus notif live, beda dari video)
 
 requirements.txt: tambahkan  TikTokLive>=6.0
 """
@@ -37,7 +37,6 @@ from typing import Dict, Optional
 
 import discord
 from discord.ext import commands, tasks
-
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, DisconnectEvent
 from TikTokLive.client.errors import (
@@ -48,11 +47,11 @@ from TikTokLive.client.errors import (
 
 log = logging.getLogger("cogs.tiktok_live")
 
-OFFLINE_RETRY_SECONDS = 300      # 5 menit — user offline, ketuk lagi nanti
-AFTER_LIVE_COOLDOWN = 300        # 5 menit — jeda setelah live berakhir/putus,
-                                 # mencegah notif dobel kalau koneksi cuma kedip
-RATE_LIMIT_BACKOFF = 900         # 15 menit — sign server TikTokLive kena limit
-ERROR_RETRY_SECONDS = 300        # 5 menit — error tak terduga lainnya
+# --- KONFIGURASI BACKOFF (DIPERBARUI) ---
+OFFLINE_RETRY_SECONDS = 1800     # 30 menit sekali (sebelumnya 15m/5m)
+AFTER_LIVE_COOLDOWN = 3600       # 1 jam (mencegah spam kalau koneksi goyang)
+RATE_LIMIT_BACKOFF = 3600        # 1 jam (kalau kena rate limit sign server, istirahat lama)
+ERROR_RETRY_SECONDS = 600        # 10 menit (error tak terduga lainnya)
 WATCHER_SYNC_MINUTES = 5         # interval sinkronisasi watcher ↔ database
 
 
@@ -104,7 +103,7 @@ class TikTokLiveCog(commands.Cog):
                 )
                 log.info("Watcher live dinyalakan untuk @%s", username)
                 
-                # --- TAMBAHAN BARU: Jeda 5 detik biar nggak dikira spammer sama TikTok ---
+                # Jeda 5 detik biar nggak dikira spammer sama TikTok saat inisiasi banyak akun
                 await asyncio.sleep(5) 
 
         # 2) Matikan watcher untuk username yang sudah dihapus dari database
@@ -125,7 +124,13 @@ class TikTokLiveCog(commands.Cog):
             try:
                 # Client dibuat BARU tiap iterasi — instance TikTokLiveClient
                 # tidak dirancang untuk di-reuse setelah disconnect.
-                client = TikTokLiveClient(unique_id=f"@{username}")
+                # Penambahan Custom header untuk menyamar sebagai browser desktop normal
+                client = TikTokLiveClient(
+                    unique_id=f"@{username}",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                    }
+                )
                 self._attach_handlers(client, username)
 
                 # Blocking: baris ini "menggantung" selama live berlangsung
@@ -141,13 +146,11 @@ class TikTokLiveCog(commands.Cog):
                 # Watcher dimatikan (cog unload / akun dihapus) — keluar bersih.
                 log.info("Watcher @%s dibatalkan.", username)
                 raise
-
             except UserOfflineError:
                 # Normal & paling sering: user sedang tidak live. Tidur, ulangi.
                 log.debug("@%s offline. Cek lagi dalam %ds.",
                           username, OFFLINE_RETRY_SECONDS)
                 await asyncio.sleep(OFFLINE_RETRY_SECONDS)
-
             except UserNotFoundError:
                 # Akun tidak eksis (typo / di-banned / ganti username).
                 # Percuma diulang — matikan satpam untuk akun ini.
@@ -157,18 +160,21 @@ class TikTokLiveCog(commands.Cog):
                     username,
                 )
                 return
-
             except SignatureRateLimitError:
                 # Sign server TikTokLive punya kuota koneksi. Backoff lebih lama.
                 log.warning("Rate limit sign server untuk @%s. Backoff %ds.",
                             username, RATE_LIMIT_BACKOFF)
                 await asyncio.sleep(RATE_LIMIT_BACKOFF)
-
-            except Exception:
-                # Jaring pengaman: error apa pun tidak boleh mematikan loop.
-                log.exception("Error tak terduga di watcher @%s. Retry dalam %ds.",
-                              username, ERROR_RETRY_SECONDS)
-                await asyncio.sleep(ERROR_RETRY_SECONDS)
+            except Exception as e:
+                # Cek apakah error karena 403 (Forbidden) atau 404 (diblokir TikTok)
+                if "403" in str(e) or "404" in str(e):
+                    log.warning(f"TikTok memblokir request untuk @{username}. Jeda lebih lama.")
+                    await asyncio.sleep(3600) # Tunggu 1 jam kalau kena blokir
+                else:
+                    # Jaring pengaman: error apa pun tidak boleh mematikan loop.
+                    log.exception("Error tak terduga di watcher @%s. Retry dalam %ds.",
+                                  username, ERROR_RETRY_SECONDS)
+                    await asyncio.sleep(ERROR_RETRY_SECONDS)
 
     # ── Registrasi event handler per client ──────────────────────────────────
     def _attach_handlers(self, client: TikTokLiveClient, username: str) -> None:
